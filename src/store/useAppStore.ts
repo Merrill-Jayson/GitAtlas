@@ -253,32 +253,117 @@ export const useAppStore = create<AppState>((set, get) => ({
 
   ingestGitHubRepo: async (githubUrl: string) => {
     set({ globalError: null });
-    const res = await fetch('/api/repositories/ingest', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ github_url: githubUrl }),
-    });
-    const data = (await res.json()) as { repository_id?: string; error?: string };
-    if (!res.ok || !data.repository_id) {
-      set({ globalError: data.error ?? 'Failed to start ingestion' });
+    try {
+      const res = await fetch('/api/repositories/ingest', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ github_url: githubUrl }),
+      });
+
+      const rawText = await res.text();
+      let data: {
+        repository_id?: string;
+        status?: string;
+        error?: string;
+        repository?: RepositorySummary;
+        graph?: { nodes: GraphNode[]; edges: GraphEdge[] };
+        tree?: FileTreeNode[];
+      } = {};
+
+      try {
+        data = JSON.parse(rawText);
+      } catch {
+        set({
+          globalError: `Server returned non-JSON response (HTTP ${res.status}). Check API routing or server logs.`,
+        });
+        return false;
+      }
+
+      if (!res.ok || !data.repository_id) {
+        set({ globalError: data.error ?? `Failed to ingest repository (HTTP ${res.status})` });
+        return false;
+      }
+
+      if (data.status === 'ready' && data.repository && data.graph && data.tree) {
+        const repo = data.repository;
+        set((s) => ({
+          activeRepoId: repo.repository_id,
+          activeRepo: repo,
+          repositories: [repo, ...s.repositories.filter((r) => r.repository_id !== repo.repository_id)],
+          graphNodes: data.graph!.nodes ?? [],
+          graphEdges: data.graph!.edges ?? [],
+          fileTree: data.tree ?? [],
+          loadingGraph: false,
+          selectedNodeId: null,
+          nodeDetails: null,
+          highlightedNodeIds: [],
+          highlightedEdgeIds: [],
+          seedNodeIds: [],
+          orderedPathNodeIds: [],
+          isHighlightActive: false,
+          collapseToModules: (data.graph!.nodes?.length ?? 0) > 120,
+          bottomTab: 'logs',
+          bottomOpen: true,
+          centerView: 'graph',
+          ingestModalOpen: false,
+        }));
+        return true;
+      }
+
+      set({ bottomTab: 'logs', bottomOpen: true, centerView: 'graph' });
+      await get().selectRepository(data.repository_id);
+      return true;
+    } catch (err) {
+      set({
+        globalError: err instanceof Error ? err.message : 'Network error while ingesting repository',
+      });
       return false;
     }
-    set({ bottomTab: 'logs', bottomOpen: true, centerView: 'graph' });
-    await get().selectRepository(data.repository_id);
-    return true;
   },
 
   ingestSampleRepo: async () => {
     set({ globalError: null });
-    const res = await fetch('/api/repositories/ingest', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ sample: true }),
-    });
-    const data = (await res.json()) as { repository_id?: string };
-    if (data.repository_id) {
-      set({ centerView: 'graph', ingestModalOpen: false });
-      await get().selectRepository(data.repository_id);
+    try {
+      const res = await fetch('/api/repositories/ingest', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sample: true }),
+      });
+      const rawText = await res.text();
+      const data = JSON.parse(rawText) as {
+        repository_id?: string;
+        repository?: RepositorySummary;
+        graph?: { nodes: GraphNode[]; edges: GraphEdge[] };
+        tree?: FileTreeNode[];
+        error?: string;
+      };
+      if (!res.ok) {
+        set({ globalError: data.error ?? `Failed to load sample repository (HTTP ${res.status})` });
+        return;
+      }
+      if (data.repository && data.graph && data.tree) {
+        const repo = data.repository;
+        set((s) => ({
+          activeRepoId: repo.repository_id,
+          activeRepo: repo,
+          repositories: [repo, ...s.repositories.filter((r) => r.repository_id !== repo.repository_id)],
+          graphNodes: data.graph!.nodes ?? [],
+          graphEdges: data.graph!.edges ?? [],
+          fileTree: data.tree ?? [],
+          loadingGraph: false,
+          centerView: 'graph',
+          ingestModalOpen: false,
+        }));
+        return;
+      }
+      if (data.repository_id) {
+        set({ centerView: 'graph', ingestModalOpen: false });
+        await get().selectRepository(data.repository_id);
+      }
+    } catch (err) {
+      set({
+        globalError: err instanceof Error ? err.message : 'Failed to reload sample repository',
+      });
     }
   },
 
@@ -310,11 +395,33 @@ export const useAppStore = create<AppState>((set, get) => ({
       const res = await fetch(
         `/api/repositories/${encodeURIComponent(repoId)}/nodes/${encodeURIComponent(nodeId)}`,
       );
-      if (!res.ok) throw new Error('Node details not found');
+      if (!res.ok) throw new Error('Node details not found on server');
       const details = (await res.json()) as NodeDetailsResponse;
       set({ nodeDetails: details, loadingNodeDetails: false });
     } catch {
-      set({ loadingNodeDetails: false });
+      // Fallback to in-memory client graph if serverless container cold-started
+      const nodes = get().graphNodes;
+      const edges = get().graphEdges;
+      const nodeMap = new Map(nodes.map((n) => [n.id, n]));
+      const node = nodeMap.get(nodeId);
+      if (node) {
+        const incoming = edges
+          .filter((e) => e.target === nodeId && nodeMap.has(e.source))
+          .map((edge) => ({ edge, node: nodeMap.get(edge.source)! }));
+        const outgoing = edges
+          .filter((e) => e.source === nodeId && nodeMap.has(e.target))
+          .map((edge) => ({ edge, node: nodeMap.get(edge.target)! }));
+        const source_lines = (node.code_snippet ?? '').split('\n').map((content, idx) => ({
+          line_number: node.start_line + idx,
+          content,
+        }));
+        set({
+          nodeDetails: { node, incoming, outgoing, source_lines },
+          loadingNodeDetails: false,
+        });
+      } else {
+        set({ loadingNodeDetails: false });
+      }
     }
   },
 
@@ -358,10 +465,19 @@ export const useAppStore = create<AppState>((set, get) => ({
     };
 
     try {
+      const fallback_graph =
+        repoId !== 'repo_shopflow_sample'
+          ? { nodes: get().graphNodes, edges: get().graphEdges }
+          : undefined;
       const res = await fetch('/api/chat/stream', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ repository_id: repoId, question: question.trim(), mode }),
+        body: JSON.stringify({
+          repository_id: repoId,
+          question: question.trim(),
+          mode,
+          fallback_graph,
+        }),
       });
 
       if (!res.ok || !res.body) {

@@ -43,10 +43,13 @@ export function IngestModal() {
     e.preventDefault();
     if (!url.trim() || submitting) return;
     setSubmitting(true);
-    const ok = await ingestGitHubRepo(url.trim());
-    setSubmitting(false);
-    if (ok) {
-      setUrl('');
+    try {
+      const ok = await ingestGitHubRepo(url.trim());
+      if (ok) {
+        setUrl('');
+      }
+    } finally {
+      setSubmitting(false);
     }
   };
 
@@ -86,9 +89,10 @@ export function IngestModal() {
               <button
                 type="submit"
                 disabled={submitting || !url.trim()}
-                className="px-4 py-2 text-xs font-medium rounded-lg bg-blue-600 hover:bg-blue-500 disabled:opacity-50 text-white transition-colors whitespace-nowrap shrink-0"
+                className="px-4 py-2 text-xs font-medium rounded-lg bg-blue-600 hover:bg-blue-500 disabled:opacity-50 text-white transition-colors whitespace-nowrap shrink-0 flex items-center gap-1.5"
               >
-                {submitting ? 'Starting...' : 'Ingest Repository'}
+                {submitting && <Loader2 className="w-3.5 h-3.5 animate-spin" />}
+                {submitting ? 'Ingesting...' : 'Ingest Repository'}
               </button>
             </div>
 

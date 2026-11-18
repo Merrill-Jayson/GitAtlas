@@ -1,6 +1,7 @@
 import { spawn } from 'child_process';
 import path from 'path';
 import type { GraphEdge, GraphNode } from '../../src/types/graph.ts';
+import { parsePythonFallback } from './py_fallback_parser.ts';
 import { parseTsJsFiles } from './ts_js_parser.ts';
 
 export interface ParseResult {
@@ -14,7 +15,7 @@ function runPythonAstParser(repoRoot: string, pyFiles: string[]): Promise<ParseR
     return Promise.resolve({ nodes: [], edges: [], warnings: [] });
   }
 
-  return new Promise((resolve, reject) => {
+  return new Promise((resolve) => {
     const scriptPath = path.resolve(process.cwd(), 'server', 'parser', 'py_ast_parser.py');
     const child = spawn('python3', [scriptPath], {
       stdio: ['pipe', 'pipe', 'pipe'],
@@ -22,10 +23,20 @@ function runPythonAstParser(repoRoot: string, pyFiles: string[]): Promise<ParseR
 
     let stdout = '';
     let stderr = '';
+    let settled = false;
+
+    const fallback = (reason: string) => {
+      if (settled) return;
+      settled = true;
+      const res = parsePythonFallback(repoRoot, pyFiles);
+      res.warnings.unshift(`Used TypeScript Python parser fallback (${reason}).`);
+      resolve(res);
+    };
+
     const timer = setTimeout(() => {
       child.kill('SIGKILL');
-      reject(new Error('Python AST parser timed out after 30s'));
-    }, 30000);
+      fallback('python3 timed out');
+    }, 25000);
 
     child.stdout.on('data', (chunk) => {
       stdout += chunk.toString();
@@ -36,20 +47,21 @@ function runPythonAstParser(repoRoot: string, pyFiles: string[]): Promise<ParseR
 
     child.on('error', (err) => {
       clearTimeout(timer);
-      reject(err);
+      fallback(err.message);
     });
 
     child.on('close', (code) => {
       clearTimeout(timer);
+      if (settled) return;
       if (code !== 0) {
-        reject(new Error(`Python AST parser exited with code ${code}: ${stderr}`));
+        fallback(`python3 exit ${code}: ${stderr.trim()}`);
         return;
       }
       try {
-        const parsed = JSON.parse(stdout) as ParseResult;
-        resolve(parsed);
+        settled = true;
+        resolve(JSON.parse(stdout) as ParseResult);
       } catch (err) {
-        reject(new Error(`Invalid JSON from Python AST parser: ${err instanceof Error ? err.message : String(err)}`));
+        fallback(err instanceof Error ? err.message : 'invalid JSON');
       }
     });
 

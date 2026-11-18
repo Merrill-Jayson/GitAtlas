@@ -1,9 +1,12 @@
 import { spawn } from 'child_process';
 import crypto from 'crypto';
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
+import zlib from 'zlib';
 import type {
   FileTreeNode,
+  GraphEdge,
   GraphNode,
   IngestionStage,
   RepositorySummary,
@@ -17,7 +20,20 @@ import { graphStore } from '../graph/graph_store.ts';
 import { parseRepositoryCodebase } from '../parser/index.ts';
 import { buildBm25Index, deleteBm25Index } from '../retrieval/hybrid_retriever.ts';
 
-const DATA_ROOT = path.resolve(process.cwd(), '.data', 'repos');
+function resolveWritableDataRoot(): string {
+  if (process.env.VERCEL === '1' || process.env.VERCEL_ENV) {
+    return path.join(os.tmpdir(), 'gitatlas_data', 'repos');
+  }
+  const localRoot = path.resolve(process.cwd(), '.data', 'repos');
+  try {
+    fs.mkdirSync(localRoot, { recursive: true });
+    return localRoot;
+  } catch {
+    return path.join(os.tmpdir(), 'gitatlas_data', 'repos');
+  }
+}
+
+const DATA_ROOT = resolveWritableDataRoot();
 const SAMPLE_REPO_PATH = path.resolve(process.cwd(), 'sample_repositories', 'shopflow_api');
 
 const IGNORED_DIRS = new Set([
@@ -47,8 +63,8 @@ const SUPPORTED_EXT_LANG: Record<string, string> = {
   '.mjs': 'javascript',
 };
 
-const MAX_FILES = 180;
-const MAX_TOTAL_BYTES = 25 * 1024 * 1024; // 25MB source cap
+const MAX_FILES = 160;
+const MAX_TOTAL_BYTES = 20 * 1024 * 1024;
 
 const repositories = new Map<string, RepositorySummary>();
 const repoFileTrees = new Map<string, FileTreeNode[]>();
@@ -59,7 +75,14 @@ function ensureDir(dir: string): void {
   }
 }
 
-export function validatePublicGitHubUrl(rawUrl: string): { valid: boolean; normalized?: string; repoName?: string; error?: string } {
+export function validatePublicGitHubUrl(rawUrl: string): {
+  valid: boolean;
+  normalized?: string;
+  owner?: string;
+  repo?: string;
+  repoName?: string;
+  error?: string;
+} {
   const trimmed = rawUrl.trim();
   if (!trimmed) {
     return { valid: false, error: 'Repository URL is required.' };
@@ -90,11 +113,18 @@ export function validatePublicGitHubUrl(rawUrl: string): { valid: boolean; norma
   return {
     valid: true,
     normalized: `https://github.com/${owner}/${repo}.git`,
+    owner,
+    repo,
     repoName: `${owner}/${repo}`,
   };
 }
 
-function appendLog(repo: RepositorySummary, stage: IngestionStage, message: string, level: 'info' | 'warn' | 'error' = 'info') {
+function appendLog(
+  repo: RepositorySummary,
+  stage: IngestionStage,
+  message: string,
+  level: 'info' | 'warn' | 'error' = 'info',
+) {
   repo.stage = stage;
   repo.message = message;
   repo.logs.push({
@@ -105,7 +135,7 @@ function appendLog(repo: RepositorySummary, stage: IngestionStage, message: stri
   });
 }
 
-function cloneGitHubRepo(cloneUrl: string, targetDir: string): Promise<void> {
+function cloneWithGitCli(cloneUrl: string, targetDir: string): Promise<void> {
   return new Promise((resolve, reject) => {
     const child = spawn('git', ['clone', '--depth', '1', '--single-branch', cloneUrl, targetDir], {
       env: { ...process.env, GIT_TERMINAL_PROMPT: '0' },
@@ -115,8 +145,8 @@ function cloneGitHubRepo(cloneUrl: string, targetDir: string): Promise<void> {
     let stderr = '';
     const timer = setTimeout(() => {
       child.kill('SIGKILL');
-      reject(new Error('Repository clone timed out after 45 seconds.'));
-    }, 45000);
+      reject(new Error('Repository clone timed out after 30 seconds.'));
+    }, 30000);
 
     child.stderr.on('data', (d) => {
       stderr += d.toString();
@@ -140,6 +170,110 @@ function cloneGitHubRepo(cloneUrl: string, targetDir: string): Promise<void> {
       resolve();
     });
   });
+}
+
+/**
+ * Pure Node.js GitHub tarball downloader + USTAR extractor.
+ * Works cleanly in serverless environments (like Vercel) where `git` CLI is absent.
+ */
+async function downloadGitHubTarball(owner: string, repo: string, targetDir: string): Promise<void> {
+  const tarUrl = `https://codeload.github.com/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/tar.gz/HEAD`;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 25000);
+
+  let compressed: Buffer;
+  try {
+    const res = await fetch(tarUrl, {
+      redirect: 'follow',
+      signal: controller.signal,
+      headers: { 'User-Agent': 'GitAtlas-Ingestor/1.0' },
+    });
+    if (res.status === 404) {
+      throw new Error('Repository not found or is private.');
+    }
+    if (!res.ok) {
+      throw new Error(`Failed to download repository archive (HTTP ${res.status}).`);
+    }
+    const arrayBuf = await res.arrayBuffer();
+    if (arrayBuf.byteLength > 45 * 1024 * 1024) {
+      throw new Error('Repository archive exceeds the 45 MB serverless download limit.');
+    }
+    compressed = Buffer.from(arrayBuf);
+  } finally {
+    clearTimeout(timeout);
+  }
+
+  const tarBuffer = zlib.gunzipSync(compressed);
+  ensureDir(targetDir);
+  const realTarget = fs.realpathSync(targetDir);
+
+  let offset = 0;
+  let writtenBytes = 0;
+
+  while (offset + 512 <= tarBuffer.length) {
+    const header = tarBuffer.subarray(offset, offset + 512);
+    // Two consecutive zero blocks signal end of archive
+    if (header.every((b) => b === 0)) break;
+
+    const rawName = header.subarray(0, 100).toString('utf8').replace(/\0.*$/, '');
+    const rawPrefix = header.subarray(345, 500).toString('utf8').replace(/\0.*$/, '');
+    const fullEntryPath = rawPrefix ? `${rawPrefix}/${rawName}` : rawName;
+
+    const sizeOctal = header.subarray(124, 136).toString('utf8').replace(/\0.*$/, '').trim();
+    const fileSize = sizeOctal ? parseInt(sizeOctal, 8) : 0;
+    const typeFlag = header.subarray(156, 157).toString('utf8');
+
+    offset += 512;
+    const paddedSize = Math.ceil(fileSize / 512) * 512;
+
+    if (Number.isNaN(fileSize) || fileSize < 0 || offset + fileSize > tarBuffer.length) {
+      break;
+    }
+
+    // Regular file ('0' or '\0')
+    if (typeFlag === '0' || typeFlag === '\0' || typeFlag === '') {
+      // Strip top-level GitHub archive prefix folder (`owner-repo-sha/...`)
+      const slashIdx = fullEntryPath.indexOf('/');
+      const relPath = slashIdx >= 0 ? fullEntryPath.slice(slashIdx + 1) : fullEntryPath;
+
+      if (relPath && !relPath.includes('..') && !path.isAbsolute(relPath)) {
+        const segments = relPath.split('/');
+        const hasIgnoredDir = segments.some((s) => IGNORED_DIRS.has(s) || s.startsWith('.'));
+        const ext = path.extname(relPath).toLowerCase();
+
+        if (!hasIgnoredDir && SUPPORTED_EXT_LANG[ext] && fileSize <= 512 * 1024) {
+          writtenBytes += fileSize;
+          if (writtenBytes <= MAX_TOTAL_BYTES) {
+            const destPath = path.resolve(realTarget, relPath);
+            if (destPath.startsWith(realTarget + path.sep)) {
+              ensureDir(path.dirname(destPath));
+              fs.writeFileSync(destPath, tarBuffer.subarray(offset, offset + fileSize));
+            }
+          }
+        }
+      }
+    }
+
+    offset += paddedSize;
+  }
+}
+
+async function fetchRepositorySource(
+  owner: string,
+  repo: string,
+  cloneUrl: string,
+  targetDir: string,
+): Promise<void> {
+  const isServerless = Boolean(process.env.VERCEL === '1' || process.env.VERCEL_ENV);
+  if (isServerless) {
+    await downloadGitHubTarball(owner, repo, targetDir);
+    return;
+  }
+  try {
+    await downloadGitHubTarball(owner, repo, targetDir);
+  } catch {
+    await cloneWithGitCli(cloneUrl, targetDir);
+  }
 }
 
 function copyDirectorySafe(src: string, dst: string): void {
@@ -278,58 +412,77 @@ function persistRepoArtifacts(
   vectors: Map<string, number[]>,
   provider: 'gemini-embedding-2' | 'lexical-fallback',
 ): void {
-  const repoDir = path.join(DATA_ROOT, repoId);
-  ensureDir(repoDir);
-  fs.writeFileSync(path.join(repoDir, 'summary.json'), JSON.stringify(summary, null, 2));
-  fs.writeFileSync(path.join(repoDir, 'tree.json'), JSON.stringify(tree, null, 2));
-  fs.writeFileSync(path.join(repoDir, 'graph.json'), JSON.stringify(graphStore.serialize(repoId)));
-  fs.writeFileSync(
-    path.join(repoDir, 'vectors.json'),
-    JSON.stringify({
-      provider,
-      vectors: Array.from(vectors.entries()),
-    }),
-  );
+  try {
+    const repoDir = path.join(DATA_ROOT, repoId);
+    ensureDir(repoDir);
+    fs.writeFileSync(path.join(repoDir, 'summary.json'), JSON.stringify(summary, null, 2));
+    fs.writeFileSync(path.join(repoDir, 'tree.json'), JSON.stringify(tree, null, 2));
+    fs.writeFileSync(path.join(repoDir, 'graph.json'), JSON.stringify(graphStore.serialize(repoId)));
+    fs.writeFileSync(
+      path.join(repoDir, 'vectors.json'),
+      JSON.stringify({
+        provider,
+        vectors: Array.from(vectors.entries()),
+      }),
+    );
+  } catch {
+    // Non-fatal if ephemeral storage rejects writes
+  }
 }
 
 export function hydratePersistedRepositories(): void {
-  ensureDir(DATA_ROOT);
-  for (const dirName of fs.readdirSync(DATA_ROOT)) {
-    const repoDir = path.join(DATA_ROOT, dirName);
-    const summaryPath = path.join(repoDir, 'summary.json');
-    const graphPath = path.join(repoDir, 'graph.json');
-    const treePath = path.join(repoDir, 'tree.json');
-    const vectorsPath = path.join(repoDir, 'vectors.json');
-    if (!fs.existsSync(summaryPath) || !fs.existsSync(graphPath)) continue;
-    try {
-      const summary = JSON.parse(fs.readFileSync(summaryPath, 'utf-8')) as RepositorySummary;
-      const graph = JSON.parse(fs.readFileSync(graphPath, 'utf-8'));
-      const tree = fs.existsSync(treePath) ? (JSON.parse(fs.readFileSync(treePath, 'utf-8')) as FileTreeNode[]) : [];
-      repositories.set(summary.repository_id, summary);
-      repoFileTrees.set(summary.repository_id, tree);
-      graphStore.createRepositoryGraph(summary.repository_id, graph.nodes ?? [], graph.edges ?? []);
-      buildBm25Index(summary.repository_id, graph.nodes ?? []);
+  try {
+    ensureDir(DATA_ROOT);
+    for (const dirName of fs.readdirSync(DATA_ROOT)) {
+      const repoDir = path.join(DATA_ROOT, dirName);
+      const summaryPath = path.join(repoDir, 'summary.json');
+      const graphPath = path.join(repoDir, 'graph.json');
+      const treePath = path.join(repoDir, 'tree.json');
+      const vectorsPath = path.join(repoDir, 'vectors.json');
+      if (!fs.existsSync(summaryPath) || !fs.existsSync(graphPath)) continue;
+      try {
+        const summary = JSON.parse(fs.readFileSync(summaryPath, 'utf-8')) as RepositorySummary;
+        const graph = JSON.parse(fs.readFileSync(graphPath, 'utf-8'));
+        const tree = fs.existsSync(treePath) ? (JSON.parse(fs.readFileSync(treePath, 'utf-8')) as FileTreeNode[]) : [];
+        repositories.set(summary.repository_id, summary);
+        repoFileTrees.set(summary.repository_id, tree);
+        graphStore.createRepositoryGraph(summary.repository_id, graph.nodes ?? [], graph.edges ?? []);
+        buildBm25Index(summary.repository_id, graph.nodes ?? []);
 
-      if (fs.existsSync(vectorsPath)) {
-        const vRaw = JSON.parse(fs.readFileSync(vectorsPath, 'utf-8')) as {
-          provider: 'gemini-embedding-2' | 'lexical-fallback';
-          vectors: Array<[string, number[]]>;
-        };
-        loadRepositoryVectors(summary.repository_id, {
-          provider: vRaw.provider,
-          vectors: new Map(vRaw.vectors),
-        });
+        if (fs.existsSync(vectorsPath)) {
+          const vRaw = JSON.parse(fs.readFileSync(vectorsPath, 'utf-8')) as {
+            provider: 'gemini-embedding-2' | 'lexical-fallback';
+            vectors: Array<[string, number[]]>;
+          };
+          loadRepositoryVectors(summary.repository_id, {
+            provider: vRaw.provider,
+            vectors: new Map(vRaw.vectors),
+          });
+        }
+      } catch {
+        // Skip corrupted persisted repo state
       }
-    } catch {
-      // Skip corrupted persisted repo state
     }
+  } catch {
+    // Ignore if DATA_ROOT is unavailable
   }
+}
+
+export async function rehydrateRepositoryFromGraph(
+  repositoryId: string,
+  nodes: GraphNode[],
+  edges: GraphEdge[],
+): Promise<void> {
+  if (graphStore.hasRepository(repositoryId)) return;
+  graphStore.createRepositoryGraph(repositoryId, nodes, edges);
+  buildBm25Index(repositoryId, nodes);
+  await indexRepositoryEmbeddings(repositoryId, nodes);
 }
 
 async function runIngestionPipeline(
   repoId: string,
   summary: RepositorySummary,
-  cloneUrl?: string,
+  sourceInfo?: { owner: string; repo: string; cloneUrl: string },
 ): Promise<void> {
   const repoDir = path.join(DATA_ROOT, repoId);
   const sourceDir = path.join(repoDir, 'source');
@@ -337,21 +490,24 @@ async function runIngestionPipeline(
   try {
     ensureDir(repoDir);
 
-    // Stage 1: Validation
     summary.progress = 10;
-    appendLog(summary, 'validation', summary.source_type === 'sample' ? 'Validated built-in ShopFlow Python sample repository.' : `Validated public GitHub URL: ${summary.github_url}`);
+    appendLog(
+      summary,
+      'validation',
+      summary.source_type === 'sample'
+        ? 'Validated built-in ShopFlow Python sample repository.'
+        : `Validated public GitHub URL: ${summary.github_url}`,
+    );
 
-    // Stage 2: Download / Copy
     summary.progress = 25;
     if (summary.source_type === 'sample') {
       appendLog(summary, 'download', 'Staging ShopFlow API sample repository source files...');
       copyDirectorySafe(SAMPLE_REPO_PATH, sourceDir);
-    } else if (cloneUrl) {
-      appendLog(summary, 'download', `Cloning ${summary.name} (shallow depth=1)...`);
-      await cloneGitHubRepo(cloneUrl, sourceDir);
+    } else if (sourceInfo) {
+      appendLog(summary, 'download', `Downloading ${summary.name} repository archive...`);
+      await fetchRepositorySource(sourceInfo.owner, sourceInfo.repo, sourceInfo.cloneUrl, sourceDir);
     }
 
-    // Stage 3: File discovery
     summary.progress = 42;
     const { files, languages, skippedCount } = discoverSourceFiles(sourceDir);
     summary.file_count = files.length;
@@ -364,20 +520,22 @@ async function runIngestionPipeline(
     appendLog(
       summary,
       'discovery',
-      `Discovered ${files.length} source files (${Object.entries(languages).map(([k, v]) => `${v} ${k}`).join(', ')})${skippedCount > 0 ? ` · skipped ${skippedCount} oversized/cap-limit files` : ''}.`,
+      `Discovered ${files.length} source files (${Object.entries(languages).map(([k, v]) => `${v} ${k}`).join(', ')})${skippedCount > 0 ? ` · skipped ${skippedCount} cap-limit files` : ''}.`,
     );
 
-    // Stage 4: AST Parsing
     summary.progress = 60;
     appendLog(summary, 'parsing', 'Running static AST parser across discovered modules (zero code execution)...');
     const parseResult = await parseRepositoryCodebase(sourceDir, files);
-    for (const w of parseResult.warnings) {
+    for (const w of parseResult.warnings.slice(0, 15)) {
       appendLog(summary, 'parsing', w, 'warn');
     }
 
-    // Stage 5: Graph Construction
     summary.progress = 75;
-    appendLog(summary, 'graph', `Constructing knowledge graph (${parseResult.nodes.length} entities, ${parseResult.edges.length} relationships)...`);
+    appendLog(
+      summary,
+      'graph',
+      `Constructing knowledge graph (${parseResult.nodes.length} entities, ${parseResult.edges.length} relationships)...`,
+    );
     graphStore.createRepositoryGraph(repoId, parseResult.nodes, parseResult.edges);
     buildBm25Index(repoId, parseResult.nodes);
     const tree = buildFileTree(files, parseResult.nodes);
@@ -385,7 +543,6 @@ async function runIngestionPipeline(
     summary.node_count = parseResult.nodes.length;
     summary.edge_count = parseResult.edges.length;
 
-    // Stage 6: Embedding Generation
     summary.progress = 88;
     appendLog(summary, 'embeddings', 'Generating per-node vector embeddings & BM25 lexical index...');
     const vecIndex = await indexRepositoryEmbeddings(repoId, parseResult.nodes, (done, total, provider) => {
@@ -395,10 +552,13 @@ async function runIngestionPipeline(
       }
     });
 
-    // Stage 7: Complete
     summary.status = 'ready';
     summary.progress = 100;
-    appendLog(summary, 'complete', `Indexing complete: ${summary.file_count} files, ${summary.node_count} nodes, ${summary.edge_count} edges.`);
+    appendLog(
+      summary,
+      'complete',
+      `Indexing complete: ${summary.file_count} files, ${summary.node_count} nodes, ${summary.edge_count} edges.`,
+    );
     persistRepoArtifacts(repoId, summary, tree, vecIndex.vectors, vecIndex.provider);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
@@ -408,9 +568,17 @@ async function runIngestionPipeline(
   }
 }
 
-export async function startGitHubIngestion(githubUrl: string): Promise<{ summary?: RepositorySummary; error?: string }> {
+export async function startGitHubIngestion(
+  githubUrl: string,
+  options: { waitForCompletion?: boolean } = {},
+): Promise<{
+  summary?: RepositorySummary;
+  graph?: { nodes: GraphNode[]; edges: GraphEdge[] };
+  tree?: FileTreeNode[];
+  error?: string;
+}> {
   const check = validatePublicGitHubUrl(githubUrl);
-  if (!check.valid || !check.normalized || !check.repoName) {
+  if (!check.valid || !check.normalized || !check.repoName || !check.owner || !check.repo) {
     return { error: check.error ?? 'Invalid GitHub URL' };
   }
 
@@ -433,8 +601,22 @@ export async function startGitHubIngestion(githubUrl: string): Promise<{ summary
   };
   repositories.set(repoId, summary);
 
-  // Run async in background so frontend can poll /status live
-  void runIngestionPipeline(repoId, summary, check.normalized);
+  const sourceInfo = { owner: check.owner, repo: check.repo, cloneUrl: check.normalized };
+
+  if (options.waitForCompletion) {
+    await runIngestionPipeline(repoId, summary, sourceInfo);
+    if (summary.status === 'failed') {
+      return { summary, error: summary.error ?? 'Repository ingestion failed' };
+    }
+    const serialized = graphStore.serialize(repoId);
+    return {
+      summary,
+      graph: { nodes: serialized.nodes, edges: serialized.edges },
+      tree: getRepositoryTree(repoId),
+    };
+  }
+
+  void runIngestionPipeline(repoId, summary, sourceInfo);
   return { summary };
 }
 
@@ -513,9 +695,13 @@ export function deleteRepositoryData(repositoryId: string): boolean {
   deleteBm25Index(repositoryId);
   deleteRepositoryVectors(repositoryId);
 
-  const repoDir = path.join(DATA_ROOT, repositoryId);
-  if (fs.existsSync(repoDir)) {
-    fs.rmSync(repoDir, { recursive: true, force: true });
+  try {
+    const repoDir = path.join(DATA_ROOT, repositoryId);
+    if (fs.existsSync(repoDir)) {
+      fs.rmSync(repoDir, { recursive: true, force: true });
+    }
+  } catch {
+    // Non-fatal
   }
   return true;
 }

@@ -85,11 +85,21 @@ export async function indexRepositoryEmbeddings(
   }
 
   let provider: 'gemini-embedding-2' | 'lexical-fallback' = 'gemini-embedding-2';
-  const batchSize = 20;
+  const batchSize = 25;
+  const maxGeminiEntities = 150;
+  const deadline = Date.now() + 9000;
 
   for (let i = 0; i < targetNodes.length; i += batchSize) {
     const batch = targetNodes.slice(i, i + batchSize);
     const texts = batch.map(buildEntityEmbeddingText);
+    if (i >= maxGeminiEntities || Date.now() > deadline) {
+      for (let j = 0; j < batch.length; j++) {
+        vectors.set(batch[j].id, deterministicLexicalVector(texts[j]));
+      }
+      onProgress?.(Math.min(i + batch.length, targetNodes.length), targetNodes.length, provider);
+      continue;
+    }
+
     try {
       const res = await ai.models.embedContent({
         model: DEFAULT_EMBEDDING_MODEL,
