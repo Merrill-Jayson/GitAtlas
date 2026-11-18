@@ -1,0 +1,14 @@
+services:
+  gitatlas:
+    build: .
+    ports:
+      - "3000:3000"
+    environment:
+      - NODE_ENV=production
+      - PORT=3000
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+    volumes:
+      - gitatlas_data:/app/.data
+
+volumes:
+  gitatlas_data:

@@ -1,0 +1,6 @@
+{
+  "name": "CodeAtlas Graph-RAG Visualizer",
+  "description": "AI-powered Graph-RAG codebase visualizer and explainer that maps repositories into interactive AST knowledge graphs with visual provenance.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

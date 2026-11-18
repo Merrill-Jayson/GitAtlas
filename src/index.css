@@ -1,0 +1,87 @@
+@import "tailwindcss";
+@custom-variant dark (&:where(.dark, .dark *));
+@import "@xyflow/react/dist/style.css";
+
+@layer base {
+  :root {
+    --font-display: 'Outfit', system-ui, -apple-system, sans-serif;
+    --font-sans: 'Plus Jakarta Sans', system-ui, -apple-system, sans-serif;
+    --font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, monospace;
+  }
+
+  body {
+    font-family: var(--font-sans);
+    font-feature-settings: "cv02", "cv03", "cv04", "cv11";
+  }
+
+  h1, h2, h3, .font-display {
+    font-family: var(--font-display);
+  }
+
+  code, pre, .font-mono {
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+  }
+}
+
+/* Custom subtle scrollbars for IDE feel */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgba(100, 116, 139, 0.25);
+  border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(100, 116, 139, 0.45);
+}
+
+/* React Flow theme integration */
+.react-flow__controls {
+  box-shadow: none !important;
+  border: 1px solid rgba(148, 163, 184, 0.2) !important;
+  border-radius: 8px !important;
+  overflow: hidden;
+}
+
+.dark .react-flow__controls-button {
+  background-color: #111827 !important;
+  border-bottom: 1px solid #1E293B !important;
+  fill: #94A3B8 !important;
+  color: #94A3B8 !important;
+}
+
+.dark .react-flow__controls-button:hover {
+  background-color: #1E293B !important;
+  fill: #F8FAFC !important;
+}
+
+.react-flow__minimap {
+  border-radius: 8px !important;
+  overflow: hidden;
+  border: 1px solid rgba(148, 163, 184, 0.2) !important;
+}
+
+@keyframes dashFlow {
+  to {
+    stroke-dashoffset: -24;
+  }
+}
+
+.edge-flow-animated {
+  stroke-dasharray: 6 6;
+  animation: dashFlow 0.9s linear infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .edge-flow-animated {
+    animation: none;
+  }
+}
